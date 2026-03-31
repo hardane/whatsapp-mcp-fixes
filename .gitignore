@@ -1,3 +1,6 @@
 *.db
+*.exe
 claude_desktop_config.json
 whatsapp.log
+store/
+.claude/
