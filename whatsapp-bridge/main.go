@@ -1337,6 +1337,17 @@ func main() {
 				}
 			}
 
+		case *events.BusinessName:
+			// Business name received (verified business accounts)
+			chatJID := resolveJID(v.JID)
+			if v.NewBusinessName != "" {
+				if err := messageStore.UpdateChatName(chatJID, v.NewBusinessName); err != nil {
+					logger.Warnf("Failed to update business name for %s: %v", chatJID, err)
+				} else {
+					logger.Infof("Business name updated: %s -> %s (was %q)", chatJID, v.NewBusinessName, v.OldBusinessName)
+				}
+			}
+
 		case *events.AppStateSyncComplete:
 			logger.Infof("App state %s synced to v%d (recovery=%v)", v.Name, v.Version, v.Recovery)
 			// After contacts app state finishes, backfill any chats still named as phone numbers
