@@ -130,32 +130,23 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 }
 
 // StoreChatFromHistory stores a chat with archive, unread, pin, and mute state from history sync.
-// When isVisibleSync is true (INITIAL_BOOTSTRAP/RECENT), the state fields are trusted and
-// override any prior values. When false (NON_BLOCKING_DATA), only name and timestamp are
-// updated on conflict — the row keeps whatever state was already set.
+// The isVisibleSync flag controls what values are used for the initial INSERT:
+//   - true  (INITIAL_BOOTSTRAP/RECENT): uses archive/pin/mute from the proto
+//   - false (NON_BLOCKING_DATA): forces archived=true (old chats not in visible list)
+//
+// On conflict, ONLY name and timestamp are updated — state fields are never overwritten.
+// App state events (Archive, Pin, Mute) are the sole authority for state updates.
 func (store *MessageStore) StoreChatFromHistory(jid, name string, lastMessageTime time.Time, isArchived bool, unreadCount uint32, markedAsUnread bool, isPinned bool, muteEndTime uint64, isVisibleSync bool) error {
 	effectiveUnread := int(unreadCount)
 	if markedAsUnread && effectiveUnread == 0 {
 		effectiveUnread = -1 // sentinel for manually marked unread
 	}
 
-	var query string
-	if isVisibleSync {
-		// Bootstrap/recent sync — these chats are in the user's visible list,
-		// so their state is authoritative. Override prior values (e.g., if
-		// NON_BLOCKING_DATA defaulted the chat to archived before bootstrap arrived).
-		query = `INSERT INTO chats (jid, name, last_message_time, is_archived, unread_count, is_pinned, mute_end_time) VALUES (?, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time,
-			 is_archived = excluded.is_archived, unread_count = excluded.unread_count,
-			 is_pinned = excluded.is_pinned, mute_end_time = excluded.mute_end_time`
-	} else {
-		// Background sync — only set state on first insert; don't overwrite
-		// values that bootstrap or app state may have already set.
-		query = `INSERT INTO chats (jid, name, last_message_time, is_archived, unread_count, is_pinned, mute_end_time) VALUES (?, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`
-	}
-
-	_, err := store.db.Exec(query, jid, name, lastMessageTime, isArchived, effectiveUnread, isPinned, int64(muteEndTime))
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time, is_archived, unread_count, is_pinned, mute_end_time) VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
+		jid, name, lastMessageTime, isArchived, effectiveUnread, isPinned, int64(muteEndTime),
+	)
 	return err
 }
 
