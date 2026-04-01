@@ -26,7 +26,9 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -1357,6 +1359,15 @@ func main() {
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
 	})
+
+	// Set device name and icon shown under "Linked Devices" on phone.
+	// Customize via WHATSAPP_DEVICE_NAME env var (default: "Koba CoS").
+	deviceName := os.Getenv("WHATSAPP_DEVICE_NAME")
+	if deviceName == "" {
+		deviceName = "Koba CoS"
+	}
+	store.DeviceProps.Os = proto.String(deviceName)
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
