@@ -23,7 +23,10 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -90,6 +93,22 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Idempotent migrations — safe to run on every startup
+	migrations := []string{
+		"ALTER TABLE chats ADD COLUMN is_archived BOOLEAN DEFAULT FALSE",
+		"ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0",
+		"ALTER TABLE messages ADD COLUMN is_read BOOLEAN DEFAULT FALSE",
+		"ALTER TABLE chats ADD COLUMN is_pinned BOOLEAN DEFAULT FALSE",
+		"ALTER TABLE chats ADD COLUMN mute_end_time INTEGER DEFAULT 0",
+	}
+	for _, migration := range migrations {
+		_, err := db.Exec(migration)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("migration failed: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -98,12 +117,43 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database (preserves is_archived and unread_count on update)
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
+	return err
+}
+
+// StoreChatFromHistory stores a chat with archive, unread, pin, and mute state from history sync.
+// When isVisibleSync is true (INITIAL_BOOTSTRAP/RECENT), the state fields are trusted and
+// override any prior values. When false (NON_BLOCKING_DATA), only name and timestamp are
+// updated on conflict — the row keeps whatever state was already set.
+func (store *MessageStore) StoreChatFromHistory(jid, name string, lastMessageTime time.Time, isArchived bool, unreadCount uint32, markedAsUnread bool, isPinned bool, muteEndTime uint64, isVisibleSync bool) error {
+	effectiveUnread := int(unreadCount)
+	if markedAsUnread && effectiveUnread == 0 {
+		effectiveUnread = -1 // sentinel for manually marked unread
+	}
+
+	var query string
+	if isVisibleSync {
+		// Bootstrap/recent sync — these chats are in the user's visible list,
+		// so their state is authoritative. Override prior values (e.g., if
+		// NON_BLOCKING_DATA defaulted the chat to archived before bootstrap arrived).
+		query = `INSERT INTO chats (jid, name, last_message_time, is_archived, unread_count, is_pinned, mute_end_time) VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time,
+			 is_archived = excluded.is_archived, unread_count = excluded.unread_count,
+			 is_pinned = excluded.is_pinned, mute_end_time = excluded.mute_end_time`
+	} else {
+		// Background sync — only set state on first insert; don't overwrite
+		// values that bootstrap or app state may have already set.
+		query = `INSERT INTO chats (jid, name, last_message_time, is_archived, unread_count, is_pinned, mute_end_time) VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`
+	}
+
+	_, err := store.db.Exec(query, jid, name, lastMessageTime, isArchived, effectiveUnread, isPinned, int64(muteEndTime))
 	return err
 }
 
@@ -116,12 +166,164 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
+	if err != nil {
+		return err
+	}
+
+	// Increment unread count for incoming messages
+	if !isFromMe {
+		_, err = store.db.Exec("UPDATE chats SET unread_count = unread_count + 1 WHERE jid = ?", chatJID)
+	}
 	return err
+}
+
+// StoreHistoryMessage stores a message from history sync without touching unread counts,
+// and sets is_read based on whether the message is within the unread window.
+func (store *MessageStore) StoreHistoryMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, isRead bool) error {
+	if content == "" && mediaType == "" {
+		return nil
+	}
+
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, is_read)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, isRead,
+	)
+	return err
+}
+
+// SetChatArchived updates the archive status of a chat (upserts so app state events
+// that arrive before history sync are not lost)
+func (store *MessageStore) SetChatArchived(chatJID string, archived bool) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, is_archived) VALUES (?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET is_archived = excluded.is_archived`,
+		chatJID, archived,
+	)
+	return err
+}
+
+// SetChatPinned updates the pin status of a chat (upserts so app state events
+// that arrive before history sync are not lost)
+func (store *MessageStore) SetChatPinned(chatJID string, pinned bool) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, is_pinned) VALUES (?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET is_pinned = excluded.is_pinned`,
+		chatJID, pinned,
+	)
+	return err
+}
+
+// SetChatMuted updates the mute end time of a chat (upserts so app state events
+// that arrive before history sync are not lost). muteEndTimestamp=0 means not muted.
+func (store *MessageStore) SetChatMuted(chatJID string, muteEndTimestamp int64) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, mute_end_time) VALUES (?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET mute_end_time = excluded.mute_end_time`,
+		chatJID, muteEndTimestamp,
+	)
+	return err
+}
+
+// UpdateChatName updates the name for a chat, but only if the current name is
+// missing or looks like a phone number (all digits). This prevents overwriting
+// a real name with a push name, while ensuring phone-number placeholders get replaced.
+func (store *MessageStore) UpdateChatName(chatJID, name string) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET name = ?
+		 WHERE jid = ? AND (name IS NULL OR name = '' OR name NOT GLOB '*[^0-9]*')`,
+		name, chatJID,
+	)
+	return err
+}
+
+// MarkChatAsRead marks all incoming messages in a chat as read and resets unread count
+func (store *MessageStore) MarkChatAsRead(chatJID string) error {
+	_, err := store.db.Exec("UPDATE messages SET is_read = TRUE WHERE chat_jid = ? AND is_from_me = FALSE AND is_read = FALSE", chatJID)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec(
+		`INSERT INTO chats (jid, unread_count) VALUES (?, 0)
+		 ON CONFLICT(jid) DO UPDATE SET unread_count = 0`,
+		chatJID,
+	)
+	return err
+}
+
+// MarkChatAsUnread sets the unread count sentinel to indicate manually marked unread
+func (store *MessageStore) MarkChatAsUnread(chatJID string) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, unread_count) VALUES (?, -1)
+		 ON CONFLICT(jid) DO UPDATE SET unread_count = -1`,
+		chatJID,
+	)
+	return err
+}
+
+// MarkMessagesAsRead marks specific messages as read and recalculates unread count
+func (store *MessageStore) MarkMessagesAsRead(chatJID string, messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	// Build placeholders for IN clause
+	placeholders := strings.Repeat("?,", len(messageIDs))
+	placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+	args := make([]interface{}, 0, len(messageIDs)+1)
+	args = append(args, chatJID)
+	for _, id := range messageIDs {
+		args = append(args, id)
+	}
+	_, err := store.db.Exec(
+		fmt.Sprintf("UPDATE messages SET is_read = TRUE WHERE chat_jid = ? AND id IN (%s)", placeholders),
+		args...,
+	)
+	if err != nil {
+		return err
+	}
+	// Recalculate unread count
+	_, err = store.db.Exec(
+		"UPDATE chats SET unread_count = (SELECT COUNT(*) FROM messages WHERE chat_jid = ? AND is_from_me = FALSE AND is_read = FALSE) WHERE jid = ?",
+		chatJID, chatJID,
+	)
+	return err
+}
+
+// GetLastMessage returns the last message in a chat for building MessageKey
+func (store *MessageStore) GetLastMessage(chatJID string) (id string, sender string, timestamp time.Time, isFromMe bool, err error) {
+	err = store.db.QueryRow(
+		"SELECT id, sender, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+		chatJID,
+	).Scan(&id, &sender, &timestamp, &isFromMe)
+	return
+}
+
+// GetUnreadMessagesBySender returns unread incoming message IDs grouped by sender for a chat
+func (store *MessageStore) GetUnreadMessagesBySender(chatJID string) (map[string][]string, error) {
+	rows, err := store.db.Query(
+		"SELECT id, sender FROM messages WHERE chat_jid = ? AND is_from_me = FALSE AND is_read = FALSE",
+		chatJID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string][]string)
+	for rows.Next() {
+		var msgID, sender string
+		if err := rows.Scan(&msgID, &sender); err != nil {
+			return nil, err
+		}
+		result[sender] = append(result[sender], msgID)
+	}
+	return result, nil
 }
 
 // Get messages from a chat
@@ -484,6 +686,26 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// ArchiveRequest represents the request body for the archive chat API
+type ArchiveRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Archive bool   `json:"archive"`
+}
+
+// MarkReadRequest represents the request body for the mark read API
+type MarkReadRequest struct {
+	ChatJID string `json:"chat_jid"`
+}
+
+// buildMessageKey constructs a MessageKey from the last message in a chat
+func buildMessageKey(chatJID, messageID string, isFromMe bool) *waCommon.MessageKey {
+	return &waCommon.MessageKey{
+		RemoteJID: proto.String(chatJID),
+		FromMe:    proto.Bool(isFromMe),
+		ID:        proto.String(messageID),
+	}
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -774,6 +996,155 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for archiving/unarchiving chats
+	http.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ArchiveRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "chat_jid is required"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Parse the JID
+		targetJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+		// For individual chats (@s.whatsapp.net), convert to LID format for app state
+		if targetJID.Server == types.DefaultUserServer {
+			lidJID, lidErr := client.Store.LIDs.GetLIDForPN(context.Background(), targetJID)
+			if lidErr != nil || lidJID.IsEmpty() {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Could not find LID for %s: %v", targetJID, lidErr)})
+				return
+			}
+			targetJID = lidJID
+		}
+		var msgKey *waCommon.MessageKey
+		var lastMsgTime time.Time
+		msgID, _, msgTimestamp, msgIsFromMe, err := messageStore.GetLastMessage(req.ChatJID)
+		if err == nil {
+			msgKey = buildMessageKey(req.ChatJID, msgID, msgIsFromMe)
+			lastMsgTime = msgTimestamp
+		}
+		patch := appstate.BuildArchive(targetJID, req.Archive, lastMsgTime, msgKey)
+		err = client.SendAppState(context.Background(), patch)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Failed to send archive state: %v", err)})
+			return
+		}
+
+		// Update local DB
+		if err := messageStore.SetChatArchived(req.ChatJID, req.Archive); err != nil {
+			fmt.Printf("Warning: failed to update local archive status: %v\n", err)
+		}
+
+		action := "archived"
+		if !req.Archive {
+			action = "unarchived"
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: fmt.Sprintf("Chat %s successfully", action)})
+	})
+
+	// Handler for marking chats as read
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "chat_jid is required"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Parse the JID
+		targetJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+		// For individual chats (@s.whatsapp.net), convert to LID format for app state
+		if targetJID.Server == types.DefaultUserServer {
+			lidJID, lidErr := client.Store.LIDs.GetLIDForPN(context.Background(), targetJID)
+			if lidErr != nil || lidJID.IsEmpty() {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Could not find LID for %s: %v", targetJID, lidErr)})
+				return
+			}
+			targetJID = lidJID
+		}
+
+		// Get last message for MessageKey
+		var msgKey *waCommon.MessageKey
+		var lastMsgTime time.Time
+		msgID, _, msgTimestamp, msgIsFromMe, err := messageStore.GetLastMessage(req.ChatJID)
+		if err == nil {
+			msgKey = buildMessageKey(req.ChatJID, msgID, msgIsFromMe)
+			lastMsgTime = msgTimestamp
+		}
+
+		// Send app state patch to sync read status to other devices
+		patch := appstate.BuildMarkChatAsRead(targetJID, true, lastMsgTime, msgKey)
+		err = client.SendAppState(context.Background(), patch)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Failed to send read state: %v", err)})
+			return
+		}
+
+		// Send blue-tick read receipts grouped by sender (required for group chats)
+		unreadBySender, err := messageStore.GetUnreadMessagesBySender(req.ChatJID)
+		if err == nil {
+			for sender, msgIDs := range unreadBySender {
+				senderJID, err := types.ParseJID(sender)
+				if err != nil {
+					continue
+				}
+				// Convert string IDs to types.MessageID
+				typedIDs := make([]types.MessageID, len(msgIDs))
+				for i, id := range msgIDs {
+					typedIDs[i] = types.MessageID(id)
+				}
+				_ = client.MarkRead(context.Background(), typedIDs, time.Now(), targetJID, senderJID)
+			}
+		}
+
+		// Update local DB
+		if err := messageStore.MarkChatAsRead(req.ChatJID); err != nil {
+			fmt.Printf("Warning: failed to update local read status: %v\n", err)
+		}
+
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as read"})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -834,6 +1205,21 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// resolveJID converts a JID to the canonical form used in our database.
+	// App state events use LID JIDs for individual chats, but history sync
+	// stores chats under phone number JIDs. This function resolves LID → PN
+	// so app state updates hit the correct row.
+	resolveJID := func(jid types.JID) string {
+		if jid.Server == "lid" {
+			pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if err == nil && !pnJID.IsEmpty() {
+				return pnJID.String()
+			}
+			// LID not mapped yet — fall back to LID string
+		}
+		return jid.String()
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -845,8 +1231,116 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.Archive:
+			chatJID := resolveJID(v.JID)
+			archived := v.Action.GetArchived()
+			fmt.Printf("[APP_STATE] Archive event: %s archived=%v\n", chatJID, archived)
+			err := messageStore.SetChatArchived(chatJID, archived)
+			if err != nil {
+				logger.Warnf("Failed to update archive status for %s: %v", chatJID, err)
+			}
+
+		case *events.Pin:
+			chatJID := resolveJID(v.JID)
+			pinned := v.Action.GetPinned()
+			fmt.Printf("[APP_STATE] Pin event: %s pinned=%v\n", chatJID, pinned)
+			err := messageStore.SetChatPinned(chatJID, pinned)
+			if err != nil {
+				logger.Warnf("Failed to update pin status for %s: %v", chatJID, err)
+			}
+
+		case *events.Mute:
+			chatJID := resolveJID(v.JID)
+			muteEnd := v.Action.GetMuteEndTimestamp()
+			fmt.Printf("[APP_STATE] Mute event: %s muteEnd=%v\n", chatJID, muteEnd)
+			err := messageStore.SetChatMuted(chatJID, muteEnd)
+			if err != nil {
+				logger.Warnf("Failed to update mute status for %s: %v", chatJID, err)
+			}
+
+		case *events.MarkChatAsRead:
+			chatJID := resolveJID(v.JID)
+			isRead := v.Action.GetRead()
+			if isRead {
+				err := messageStore.MarkChatAsRead(chatJID)
+				if err != nil {
+					logger.Warnf("Failed to mark chat %s as read: %v", chatJID, err)
+				}
+			} else {
+				err := messageStore.MarkChatAsUnread(chatJID)
+				if err != nil {
+					logger.Warnf("Failed to mark chat %s as unread: %v", chatJID, err)
+				}
+			}
+			logger.Infof("Chat %s read status: %v", chatJID, isRead)
+
+		case *events.Receipt:
+			if v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf {
+				chatJID := v.Chat.String()
+				err := messageStore.MarkMessagesAsRead(chatJID, v.MessageIDs)
+				if err != nil {
+					logger.Warnf("Failed to mark messages as read in %s: %v", chatJID, err)
+				} else {
+					logger.Infof("Marked %d messages as read in %s (type: %s)", len(v.MessageIDs), chatJID, v.Type)
+				}
+			}
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+
+		case *events.AppStateSyncError:
+			// When app state sync fails (e.g. corrupted LTHash in the patch chain),
+			// reset stored state and request a recovery snapshot from the phone.
+			// Recovery bypasses the patch chain entirely.
+			logger.Warnf("App state sync failed for %s, requesting recovery: %v", v.Name, v.Error)
+			go func(name appstate.WAPatchName) {
+				// Clear stored version so recovery response won't be rejected
+				if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(name)); err != nil {
+					logger.Warnf("Failed to clear app state version for %s: %v", name, err)
+				}
+				// Brief delay to ensure signal sessions are fully established
+				time.Sleep(3 * time.Second)
+				msg := whatsmeow.BuildAppStateRecoveryRequest(name)
+				_, err := client.SendPeerMessage(context.Background(), msg)
+				if err != nil {
+					logger.Warnf("Recovery request failed for %s: %v", name, err)
+				} else {
+					logger.Infof("Recovery request sent for %s, waiting for phone to respond...", name)
+				}
+			}(v.Name)
+
+		case *events.Contact:
+			// Contact name updated from app state sync (address book entry changed)
+			chatJID := resolveJID(v.JID)
+			fullName := v.Action.GetFullName()
+			firstName := v.Action.GetFirstName()
+			name := fullName
+			if name == "" {
+				name = firstName
+			}
+			if name != "" {
+				if err := messageStore.UpdateChatName(chatJID, name); err != nil {
+					logger.Warnf("Failed to update contact name for %s: %v", chatJID, err)
+				} else {
+					logger.Infof("Contact name updated: %s -> %s", chatJID, name)
+				}
+			}
+
+		case *events.PushName:
+			// Push name received from an incoming message
+			chatJID := resolveJID(v.JID)
+			if v.NewPushName != "" {
+				if err := messageStore.UpdateChatName(chatJID, v.NewPushName); err != nil {
+					logger.Warnf("Failed to update push name for %s: %v", chatJID, err)
+				} else {
+					logger.Infof("Push name updated: %s -> %s (was %q)", chatJID, v.NewPushName, v.OldPushName)
+				}
+			}
+
+		case *events.AppStateSyncComplete:
+			logger.Infof("App state %s synced to v%d (recovery=%v)", v.Name, v.Version, v.Recovery)
+			// After contacts app state finishes, backfill any chats still named as phone numbers
+			go backfillContactNames(client, messageStore, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -922,13 +1416,26 @@ func main() {
 	client.Disconnect()
 }
 
+// isPhoneNumber returns true if s consists entirely of digits (a phone-number placeholder).
+func isPhoneNumber(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real (non-phone-number) name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && !isPhoneNumber(existingName) {
+		// Chat exists with a real name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -987,15 +1494,23 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Try contact store — check FullName, PushName, BusinessName in order
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		if err == nil {
+			if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.PushName != "" {
+				name = contact.PushName
+			} else if contact.BusinessName != "" {
+				name = contact.BusinessName
+			}
+		}
+
+		// Fallbacks
+		if name == "" && sender != "" {
 			name = sender
-		} else {
-			// Last fallback to JID
+		}
+		if name == "" {
 			name = jid.User
 		}
 
@@ -1007,7 +1522,15 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	syncType := historySync.Data.GetSyncType()
+	fmt.Printf("Received history sync event: type=%s, conversations=%d\n", syncType, len(historySync.Data.Conversations))
+
+	// Only trust archive/pin/mute state from bootstrap and recent syncs.
+	// NON_BLOCKING_DATA contains old/background chats that aren't in the
+	// user's visible list — default those to archived so they don't pollute
+	// the main chat list.
+	isVisibleSync := syncType == waHistorySync.HistorySync_INITIAL_BOOTSTRAP ||
+		syncType == waHistorySync.HistorySync_RECENT
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1028,6 +1551,26 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
+		// Read archive, unread, pin, and mute state from the conversation proto.
+		// For non-visible syncs (NON_BLOCKING_DATA), override to archived with
+		// no unread/pin/mute — these are old chats not in the user's main list.
+		var isArchived bool
+		var unreadCount uint32
+		var markedAsUnread bool
+		var isPinned bool
+		var muteEndTime uint64
+
+		if isVisibleSync {
+			isArchived = conversation.GetArchived()
+			unreadCount = conversation.GetUnreadCount()
+			markedAsUnread = conversation.GetMarkedAsUnread()
+			isPinned = conversation.GetPinned() > 0
+			muteEndTime = conversation.GetMuteEndTime()
+		} else {
+			// Old/background chat — default to archived
+			isArchived = true
+		}
+
 		// Process messages
 		messages := conversation.Messages
 		if len(messages) > 0 {
@@ -1045,7 +1588,24 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			messageStore.StoreChatFromHistory(chatJID, name, timestamp, isArchived, unreadCount, markedAsUnread, isPinned, muteEndTime, isVisibleSync)
+
+			// Count incoming messages to determine which are unread.
+			// Messages are ordered newest-first; the last `unreadCount` incoming
+			// messages should be marked as unread.
+			incomingCount := 0
+			for _, msg := range messages {
+				if msg == nil || msg.Message == nil || msg.Message.Key == nil {
+					continue
+				}
+				fromMe := msg.Message.Key.FromMe != nil && *msg.Message.Key.FromMe
+				if !fromMe {
+					incomingCount++
+				}
+			}
+
+			// Track how many incoming messages we've seen (newest first)
+			incomingSeen := 0
 
 			// Store messages
 			for _, msg := range messages {
@@ -1112,7 +1672,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				err = messageStore.StoreMessage(
+				// Determine read status: the newest `unreadCount` incoming messages
+				// are unread, everything else is read. Messages from me are always read.
+				isRead := true
+				if !isFromMe {
+					incomingSeen++
+					if incomingSeen <= int(unreadCount) {
+						isRead = false
+					}
+				}
+
+				err = messageStore.StoreHistoryMessage(
 					msgID,
 					chatJID,
 					sender,
@@ -1126,6 +1696,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					isRead,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
@@ -1145,6 +1716,42 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+}
+
+// backfillContactNames iterates over all chats whose name is still a phone number
+// and tries to resolve a real name from whatsmeow's contact store.
+func backfillContactNames(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		logger.Warnf("Failed to get contacts for backfill: %v", err)
+		return
+	}
+
+	updated := 0
+	for jid, info := range contacts {
+		name := info.FullName
+		if name == "" {
+			name = info.PushName
+		}
+		if name == "" {
+			name = info.BusinessName
+		}
+		if name == "" {
+			continue
+		}
+
+		chatJID := jid.String()
+		err := messageStore.UpdateChatName(chatJID, name)
+		if err != nil {
+			logger.Warnf("Backfill: failed to update %s: %v", chatJID, err)
+		} else {
+			updated++
+		}
+	}
+
+	if updated > 0 {
+		logger.Infof("Contact backfill: updated %d chat names from %d contacts", updated, len(contacts))
+	}
 }
 
 // Request history sync from the server

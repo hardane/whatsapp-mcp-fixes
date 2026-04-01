@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    archive_chat as whatsapp_archive_chat,
+    mark_chat_as_read as whatsapp_mark_chat_as_read,
+    get_unread_messages as whatsapp_get_unread_messages,
 )
 
 # Initialize FastMCP server
@@ -245,6 +248,68 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def get_unarchived_chats(
+    query: Optional[str] = None,
+    limit: int = 20,
+    page: int = 0,
+    include_last_message: bool = True,
+    sort_by: str = "last_active"
+) -> List[Dict[str, Any]]:
+    """Get WhatsApp chats that are not archived.
+
+    Args:
+        query: Optional search term to filter chats by name or JID
+        limit: Maximum number of chats to return (default 20)
+        page: Page number for pagination (default 0)
+        include_last_message: Whether to include the last message in each chat (default True)
+        sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+    """
+    chats = whatsapp_list_chats(
+        query=query,
+        limit=limit,
+        page=page,
+        include_last_message=include_last_message,
+        sort_by=sort_by,
+        include_archived=False,
+    )
+    return chats
+
+@mcp.tool()
+def archive_chat(chat_jid: str, archive: bool = True) -> Dict[str, Any]:
+    """Archive or unarchive a WhatsApp chat. Syncs to all devices.
+
+    Args:
+        chat_jid: The JID of the chat to archive/unarchive
+        archive: True to archive, False to unarchive (default True)
+    """
+    success, status_message = whatsapp_archive_chat(chat_jid, archive)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def mark_chat_as_read(chat_jid: str) -> Dict[str, Any]:
+    """Mark all messages in a WhatsApp chat as read. Sends read receipts (blue ticks) and syncs to all devices.
+
+    Args:
+        chat_jid: The JID of the chat to mark as read
+    """
+    success, status_message = whatsapp_mark_chat_as_read(chat_jid)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def get_unread_messages(
+    chat_jid: Optional[str] = None,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Get unread WhatsApp messages, optionally filtered by chat.
+
+    Args:
+        chat_jid: Optional chat JID to filter by a specific chat
+        limit: Maximum number of messages to return (default 50)
+    """
+    messages = whatsapp_get_unread_messages(chat_jid=chat_jid, limit=limit)
+    return messages
 
 if __name__ == "__main__":
     # Initialize and run the server
