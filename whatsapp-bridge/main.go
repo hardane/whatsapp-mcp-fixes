@@ -42,6 +42,10 @@ import (
 var pendingRecoveryMu sync.Mutex
 var pendingRecovery = make(map[appstate.WAPatchName]bool)
 
+// recoveryDone is signaled when AppStateSyncComplete fires with Recovery=true.
+// Used by /api/test-recovery to wait for the phone's response.
+var recoveryDone = make(chan appstate.WAPatchName, 4)
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -1166,6 +1170,174 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Chat marked as read"})
 	})
 
+	// Diagnostic endpoint: tests app state recovery using two strategies.
+	// Query params:
+	//   ?collection=regular_low (default) — which app state to recover
+	//   ?strategy=server (default) | phone | both
+	http.HandleFunc("/api/test-recovery", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		// Parse collection name from query param
+		collectionParam := r.URL.Query().Get("collection")
+		if collectionParam == "" {
+			collectionParam = "regular_low"
+		}
+		var name appstate.WAPatchName
+		switch collectionParam {
+		case "regular_low":
+			name = appstate.WAPatchRegularLow
+		case "regular_high":
+			name = appstate.WAPatchRegularHigh
+		case "regular":
+			name = appstate.WAPatchRegular
+		case "critical_block":
+			name = appstate.WAPatchCriticalBlock
+		case "critical_unblock_low":
+			name = appstate.WAPatchCriticalUnblockLow
+		default:
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Unknown collection: %s. Valid: regular_low, regular_high, regular, critical_block, critical_unblock_low", collectionParam)})
+			return
+		}
+
+		strategy := r.URL.Query().Get("strategy")
+		if strategy == "" {
+			strategy = "server"
+		}
+
+		type stepResult struct {
+			Step    string `json:"step"`
+			Success bool   `json:"success"`
+			Detail  string `json:"detail"`
+		}
+		var steps []stepResult
+
+		// Strategy A: FetchAppState from WhatsApp server (no phone involvement)
+		if strategy == "server" || strategy == "both" {
+			fmt.Fprintf(os.Stderr, "[test-recovery] === SERVER STRATEGY for %s ===\n", name)
+
+			// Step 1: check current version
+			currentVersion, _, err := client.Store.AppState.GetAppStateVersion(context.Background(), string(name))
+			fmt.Fprintf(os.Stderr, "[test-recovery] Current local version for %s: v%d (err=%v)\n", name, currentVersion, err)
+			steps = append(steps, stepResult{"server_current_version", err == nil, fmt.Sprintf("v%d", currentVersion)})
+
+			// Step 2: delete local version to force full re-sync
+			fmt.Fprintf(os.Stderr, "[test-recovery] Deleting local app state version for %s...\n", name)
+			if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(name)); err != nil {
+				steps = append(steps, stepResult{"server_delete_version", false, err.Error()})
+			} else {
+				steps = append(steps, stepResult{"server_delete_version", true, "OK"})
+			}
+
+			// Step 3: FetchAppState with fullSync=true
+			fmt.Fprintf(os.Stderr, "[test-recovery] FetchAppState(%s, fullSync=true)...\n", name)
+			if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
+				errMsg := fmt.Sprintf("FetchAppState failed: %v", err)
+				fmt.Fprintf(os.Stderr, "[test-recovery] %s\n", errMsg)
+				steps = append(steps, stepResult{"server_fetch", false, errMsg})
+			} else {
+				newVersion, _, _ := client.Store.AppState.GetAppStateVersion(context.Background(), string(name))
+				result := fmt.Sprintf("OK — now at v%d", newVersion)
+				fmt.Fprintf(os.Stderr, "[test-recovery] %s\n", result)
+				steps = append(steps, stepResult{"server_fetch", true, result})
+			}
+		}
+
+		// Strategy B: ask the phone directly via peer message
+		if strategy == "phone" || strategy == "both" {
+			fmt.Fprintf(os.Stderr, "[test-recovery] === PHONE STRATEGY for %s ===\n", name)
+
+			// Drain any stale signals
+			for {
+				select {
+				case <-recoveryDone:
+				default:
+					goto drained
+				}
+			}
+		drained:
+
+			// Step 1: delete local app state version
+			fmt.Fprintf(os.Stderr, "[test-recovery] Deleting local app state version for %s...\n", name)
+			if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(name)); err != nil {
+				steps = append(steps, stepResult{"phone_delete_version", false, err.Error()})
+			} else {
+				steps = append(steps, stepResult{"phone_delete_version", true, "OK"})
+			}
+
+			// Step 2: build and send recovery request
+			fmt.Fprintf(os.Stderr, "[test-recovery] Sending peer recovery request for %s...\n", name)
+			msg := whatsmeow.BuildAppStateRecoveryRequest(name)
+			_, err := client.SendPeerMessage(context.Background(), msg)
+			if err != nil {
+				steps = append(steps, stepResult{"phone_send", false, err.Error()})
+			} else {
+				steps = append(steps, stepResult{"phone_send", true, "OK — peer message sent"})
+
+				// Step 3: wait for phone response
+				fmt.Fprintf(os.Stderr, "[test-recovery] Waiting up to 30s for phone response...\n")
+				select {
+				case recovered := <-recoveryDone:
+					result := fmt.Sprintf("Phone responded with recovery for %s", recovered)
+					fmt.Fprintf(os.Stderr, "[test-recovery] %s\n", result)
+					steps = append(steps, stepResult{"phone_wait", true, result})
+				case <-time.After(120 * time.Second):
+					fmt.Fprintf(os.Stderr, "[test-recovery] TIMEOUT — no phone response\n")
+					steps = append(steps, stepResult{"phone_wait", false, "TIMEOUT — no response from phone within 120s"})
+				}
+			}
+		}
+
+		// Return structured results
+		allOK := true
+		for _, s := range steps {
+			if !s.Success {
+				allOK = false
+				break
+			}
+		}
+		result := map[string]interface{}{
+			"success":    allOK,
+			"collection": string(name),
+			"strategy":   strategy,
+			"steps":      steps,
+		}
+		if !allOK {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(result)
+	})
+
+	// Nuclear option: sends APP_STATE_FATAL_EXCEPTION_NOTIFICATION to the phone,
+	// which resets the app state collections on the server. ALL linked devices will
+	// be logged out. After this, delete DBs, restart, and re-scan QR.
+	http.HandleFunc("/api/nuke-appstate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(os.Stderr, "[nuke-appstate] Building fatal exception notification for regular_low...\n")
+		msg := whatsmeow.BuildFatalAppStateExceptionNotification(appstate.WAPatchRegularLow)
+		fmt.Fprintf(os.Stderr, "[nuke-appstate] Sending to phone...\n")
+		_, err := client.SendPeerMessage(context.Background(), msg)
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to send fatal exception notification: %v", err)
+			fmt.Fprintf(os.Stderr, "[nuke-appstate] %s\n", errMsg)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: errMsg})
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[nuke-appstate] Sent. All linked devices will be logged out.\n")
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: true,
+			Message: "Fatal exception notification sent. All linked devices will be logged out. Delete DBs, restart bridge, and re-scan QR code.",
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1351,6 +1523,10 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			// Debug: log any protocol messages (recovery responses come back this way)
+			if protoMsg := v.Message.GetProtocolMessage(); protoMsg != nil {
+				logger.Infof("[PROTO] Received ProtocolMessage type=%v from %s", protoMsg.GetType(), v.Info.Sender.String())
+			}
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
@@ -1490,10 +1666,17 @@ func main() {
 			}
 
 		case *events.AppStateSyncComplete:
+			fmt.Fprintf(os.Stderr, "[APP_STATE_SYNC] %s synced to v%d (recovery=%v)\n", v.Name, v.Version, v.Recovery)
 			logger.Infof("App state %s synced to v%d (recovery=%v)", v.Name, v.Version, v.Recovery)
 			pendingRecoveryMu.Lock()
 			delete(pendingRecovery, v.Name)
 			pendingRecoveryMu.Unlock()
+			if v.Recovery {
+				select {
+				case recoveryDone <- v.Name:
+				default:
+				}
+			}
 			// After contacts app state finishes, backfill any chats still named as phone numbers
 			go backfillContactNames(client, messageStore, logger)
 
