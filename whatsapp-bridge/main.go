@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -14,13 +16,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -35,6 +36,11 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// Package-level app state recovery tracking.
+// HTTP handlers check these to avoid sending mutations while recovery is in progress.
+var pendingRecoveryMu sync.Mutex
+var pendingRecovery = make(map[appstate.WAPatchName]bool)
 
 // Message represents a chat message for our client
 type Message struct {
@@ -1028,11 +1034,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			}
 			targetJID = lidJID
 		}
+		// Block mutation if app state recovery is in progress
+		pendingRecoveryMu.Lock()
+		recovering := pendingRecovery[appstate.WAPatchRegularLow]
+		pendingRecoveryMu.Unlock()
+		if recovering {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "App state recovery in progress, please retry later"})
+			return
+		}
+
 		var msgKey *waCommon.MessageKey
 		var lastMsgTime time.Time
 		msgID, _, msgTimestamp, msgIsFromMe, err := messageStore.GetLastMessage(req.ChatJID)
 		if err == nil {
-			msgKey = buildMessageKey(req.ChatJID, msgID, msgIsFromMe)
+			// Use targetJID (LID-converted) so the MessageKey JID matches the patch index
+			msgKey = buildMessageKey(targetJID.String(), msgID, msgIsFromMe)
 			lastMsgTime = msgTimestamp
 		}
 		patch := appstate.BuildArchive(targetJID, req.Archive, lastMsgTime, msgKey)
@@ -1095,12 +1112,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			targetJID = lidJID
 		}
 
+		// Block mutation if app state recovery is in progress
+		pendingRecoveryMu.Lock()
+		recovering := pendingRecovery[appstate.WAPatchRegularLow]
+		pendingRecoveryMu.Unlock()
+		if recovering {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "App state recovery in progress, please retry later"})
+			return
+		}
+
 		// Get last message for MessageKey
 		var msgKey *waCommon.MessageKey
 		var lastMsgTime time.Time
 		msgID, _, msgTimestamp, msgIsFromMe, err := messageStore.GetLastMessage(req.ChatJID)
 		if err == nil {
-			msgKey = buildMessageKey(req.ChatJID, msgID, msgIsFromMe)
+			// Use targetJID (LID-converted) so the MessageKey JID matches the patch index
+			msgKey = buildMessageKey(targetJID.String(), msgID, msgIsFromMe)
 			lastMsgTime = msgTimestamp
 		}
 
@@ -1150,13 +1178,96 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// loadEnv reads a .env file and sets environment variables (does not override existing ones).
+func loadEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
+}
+
+var httpAlertClient = &http.Client{Timeout: 10 * time.Second}
+
+// sendLogAlert sends a fire-and-forget HTTP POST with the log level and message.
+func sendLogAlert(level, message, logsURL, bearerToken string) {
+	if logsURL == "" || bearerToken == "" {
+		return
+	}
+	go func() {
+		payload, _ := json.Marshal(map[string]string{
+			"level":   level,
+			"message": message,
+		})
+		req, err := http.NewRequest("POST", logsURL, bytes.NewReader(payload))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+		resp, err := httpAlertClient.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
+}
+
+// alertLogger wraps a waLog.Logger to also send WARN/ERROR logs via HTTP.
+type alertLogger struct {
+	waLog.Logger
+	logsURL     string
+	bearerToken string
+}
+
+func (l *alertLogger) Warnf(msg string, args ...interface{}) {
+	l.Logger.Warnf(msg, args...)
+	sendLogAlert("warning", fmt.Sprintf(msg, args...), l.logsURL, l.bearerToken)
+}
+
+func (l *alertLogger) Errorf(msg string, args ...interface{}) {
+	l.Logger.Errorf(msg, args...)
+	sendLogAlert("error", fmt.Sprintf(msg, args...), l.logsURL, l.bearerToken)
+}
+
+func (l *alertLogger) Sub(module string) waLog.Logger {
+	return &alertLogger{
+		Logger:      l.Logger.Sub(module),
+		logsURL:     l.logsURL,
+		bearerToken: l.bearerToken,
+	}
+}
+
 func main() {
-	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	// Load .env file (next to executable)
+	loadEnv(".env")
+
+	logsURL := os.Getenv("LOGS_URL")
+	bearerToken := os.Getenv("LOGS_BEARER_TOKEN")
+
+	// Set up logger (with optional HTTP alerting for WARN/ERROR)
+	baseLogger := waLog.Stdout("Client", "INFO", true)
+	logger := waLog.Logger(&alertLogger{Logger: baseLogger, logsURL: logsURL, bearerToken: bearerToken})
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := waLog.Logger(&alertLogger{Logger: waLog.Stdout("Database", "INFO", true), logsURL: logsURL, bearerToken: bearerToken})
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -1211,6 +1322,29 @@ func main() {
 			// LID not mapped yet — fall back to LID string
 		}
 		return jid.String()
+	}
+
+	// attemptRecovery tries to fix a broken app state patch chain.
+	// Step 1: full re-sync from the WhatsApp server (requests a snapshot).
+	// Step 2 (fallback): ask the phone for an unencrypted recovery copy.
+	attemptRecovery := func(name appstate.WAPatchName) {
+		logger.Infof("Attempting full re-sync of %s from server...", name)
+		if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
+			logger.Warnf("Full re-sync of %s failed: %v — falling back to phone recovery request", name, err)
+			if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(name)); err != nil {
+				logger.Warnf("Failed to clear app state version for %s: %v", name, err)
+			}
+			time.Sleep(3 * time.Second)
+			msg := whatsmeow.BuildAppStateRecoveryRequest(name)
+			_, err := client.SendPeerMessage(context.Background(), msg)
+			if err != nil {
+				logger.Warnf("Recovery request to phone failed for %s: %v", name, err)
+			} else {
+				logger.Infof("Recovery request sent to phone for %s, waiting for response...", name)
+			}
+		} else {
+			logger.Infof("Full re-sync of %s from server succeeded", name)
+		}
 	}
 
 	// Setup event handling for messages and history sync
@@ -1280,26 +1414,40 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			pendingRecoveryMu.Lock()
+			pending := make([]appstate.WAPatchName, 0, len(pendingRecovery))
+			for name := range pendingRecovery {
+				pending = append(pending, name)
+			}
+			pendingRecoveryMu.Unlock()
+			if len(pending) > 0 {
+				logger.Infof("Retrying recovery for %d app state(s) after reconnect: %v", len(pending), pending)
+				go func(names []appstate.WAPatchName) {
+					// Wait for signal sessions to be fully established
+					time.Sleep(5 * time.Second)
+					for _, name := range names {
+						attemptRecovery(name)
+					}
+				}(pending)
+			}
 
 		case *events.AppStateSyncError:
 			// When app state sync fails (e.g. corrupted LTHash in the patch chain),
-			// reset stored state and request a recovery snapshot from the phone.
-			// Recovery bypasses the patch chain entirely.
-			logger.Warnf("App state sync failed for %s, requesting recovery: %v", v.Name, v.Error)
+			// try a full re-sync from the server, then fall back to phone recovery.
+			logger.Warnf("App state sync failed for %s: %v", v.Name, v.Error)
+			pendingRecoveryMu.Lock()
+			alreadyRecovering := pendingRecovery[v.Name]
+			if !alreadyRecovering {
+				pendingRecovery[v.Name] = true
+			}
+			pendingRecoveryMu.Unlock()
+			if alreadyRecovering {
+				// Recovery already in progress (e.g. FetchAppState retry also failed)
+				logger.Warnf("Recovery already in progress for %s, skipping duplicate", v.Name)
+				break
+			}
 			go func(name appstate.WAPatchName) {
-				// Clear stored version so recovery response won't be rejected
-				if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(name)); err != nil {
-					logger.Warnf("Failed to clear app state version for %s: %v", name, err)
-				}
-				// Brief delay to ensure signal sessions are fully established
-				time.Sleep(3 * time.Second)
-				msg := whatsmeow.BuildAppStateRecoveryRequest(name)
-				_, err := client.SendPeerMessage(context.Background(), msg)
-				if err != nil {
-					logger.Warnf("Recovery request failed for %s: %v", name, err)
-				} else {
-					logger.Infof("Recovery request sent for %s, waiting for phone to respond...", name)
-				}
+				attemptRecovery(name)
 			}(v.Name)
 
 		case *events.Contact:
@@ -1343,6 +1491,9 @@ func main() {
 
 		case *events.AppStateSyncComplete:
 			logger.Infof("App state %s synced to v%d (recovery=%v)", v.Name, v.Version, v.Recovery)
+			pendingRecoveryMu.Lock()
+			delete(pendingRecovery, v.Name)
+			pendingRecoveryMu.Unlock()
 			// After contacts app state finishes, backfill any chats still named as phone numbers
 			go backfillContactNames(client, messageStore, logger)
 
@@ -1411,6 +1562,21 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// One-time clean resync of regular_low app state to clear any corrupted LTHash chain.
+	// This runs on every startup to ensure we start with a valid patch chain.
+	go func() {
+		time.Sleep(3 * time.Second) // let signal sessions establish
+		logger.Infof("Performing startup resync of regular_low app state...")
+		if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow)); err != nil {
+			logger.Warnf("Failed to clear regular_low app state version on startup: %v", err)
+		}
+		if err := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false); err != nil {
+			logger.Warnf("Startup resync of regular_low failed: %v (will recover on demand)", err)
+		} else {
+			logger.Infof("Startup resync of regular_low succeeded")
+		}
+	}()
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)

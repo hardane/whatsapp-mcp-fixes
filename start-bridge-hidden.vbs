@@ -1,2 +1,3 @@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """C:\Dev\whatsapp-mcp\whatsapp-bridge\main.exe""", 0, False
+WshShell.CurrentDirectory = "C:\Dev\whatsapp-mcp\whatsapp-bridge"
+WshShell.Run """C:\Dev\whatsapp-mcp\whatsapp-bridge\whatsapp-bridge.exe""", 0, False

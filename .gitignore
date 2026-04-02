@@ -4,3 +4,8 @@ claude_desktop_config.json
 whatsapp.log
 store/
 .claude/
+.env
+quick-commands.md
+.mcp.json
+start-bridge-hidden.vbs
+TOOLS-REFERENCE.md
