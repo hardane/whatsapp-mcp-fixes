@@ -1731,11 +1731,23 @@ func main() {
 			return
 		}
 	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
+		// Already logged in, connect with exponential backoff retry.
+		// This handles cases where the bridge starts before the network is ready
+		// (e.g. auto-start on login before WiFi connects).
+		maxRetries := 6
+		backoff := 2 * time.Second
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err = client.Connect()
+			if err == nil {
+				break
+			}
+			if attempt == maxRetries {
+				logger.Errorf("Failed to connect after %d attempts: %v", maxRetries, err)
+				return
+			}
+			logger.Warnf("Connection attempt %d/%d failed: %v — retrying in %v", attempt, maxRetries, err, backoff)
+			time.Sleep(backoff)
+			backoff *= 2
 		}
 		connected <- true
 	}
