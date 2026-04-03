@@ -683,10 +683,11 @@ type DownloadMediaRequest struct {
 
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
-	Filename string `json:"filename,omitempty"`
-	Path     string `json:"path,omitempty"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Filename  string `json:"filename,omitempty"`
+	Path      string `json:"path,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
 }
 
 // ArchiveRequest represents the request body for the archive chat API
@@ -992,10 +993,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+			Success:   true,
+			Message:   fmt.Sprintf("Successfully downloaded %s media", mediaType),
+			Filename:  filename,
+			Path:      path,
+			MediaType: mediaType,
 		})
 	})
 

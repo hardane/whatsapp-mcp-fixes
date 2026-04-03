@@ -5,10 +5,12 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import base64
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+N8N_TRANSCRIPTION_URL = "https://n8n.calintent.com/webhook/koba/whatsapp/transcribe"
 
 @dataclass
 class Message:
@@ -789,15 +791,42 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def download_media(message_id: str, chat_jid: str) -> Optional[str]:
-    """Download media from a message and return the local file path.
-    
+def _transcribe_audio(file_path: str, filename: str) -> Optional[str]:
+    """Send an audio file to n8n for transcription.
+
+    Returns the transcript text on success, None on failure.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        resp = requests.post(
+            N8N_TRANSCRIPTION_URL,
+            json={"audio_base64": audio_b64, "filename": filename},
+            timeout=30,
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                return data.get("transcript", "")
+
+        print(f"Transcription failed: HTTP {resp.status_code}")
+        return None
+    except Exception as e:
+        print(f"Transcription error: {str(e)}")
+        return None
+
+
+def download_media(message_id: str, chat_jid: str) -> Optional[dict]:
+    """Download media from a message. Audio files are automatically transcribed.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
-        The local file path if download was successful, None otherwise
+        A dict with path, media_type, filename, and optionally transcript. None on failure.
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/download"
@@ -805,22 +834,30 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
+
         response = requests.post(url, json=payload)
-        
+
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
+                media_type = result.get("media_type", "")
+                filename = result.get("filename", "")
                 print(f"Media downloaded successfully: {path}")
-                return path
+
+                out = {"path": path, "media_type": media_type, "filename": filename}
+
+                if media_type == "audio":
+                    out["transcript"] = _transcribe_audio(path, filename)
+
+                return out
             else:
                 print(f"Download failed: {result.get('message', 'Unknown error')}")
                 return None
         else:
             print(f"Error: HTTP {response.status_code} - {response.text}")
             return None
-            
+
     except requests.RequestException as e:
         print(f"Request error: {str(e)}")
         return None

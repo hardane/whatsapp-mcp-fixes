@@ -226,28 +226,37 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
-    
+    """Download media from a WhatsApp message. Audio files are automatically transcribed.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
-        A dictionary containing success status, a status message, and the file path if successful
+        A dictionary containing success status, message, file_path, and transcript for audio
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
-    if file_path:
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": file_path
-        }
-    else:
+    result = whatsapp_download_media(message_id, chat_jid)
+
+    if result is None:
         return {
             "success": False,
             "message": "Failed to download media"
         }
+
+    response = {
+        "success": True,
+        "message": "Media downloaded successfully",
+        "file_path": result["path"]
+    }
+
+    if result.get("transcript"):
+        response["transcript"] = result["transcript"]
+        response["message"] = "Audio transcribed successfully"
+    elif result.get("media_type") == "audio":
+        response["transcript"] = "audio, could not transcribe"
+        response["message"] = "Audio downloaded but transcription failed"
+
+    return response
 
 @mcp.tool()
 def get_unarchived_chats(
