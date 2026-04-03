@@ -1472,6 +1472,10 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Emit Archive/Pin/Mute events during full app state syncs so our handler
+	// can update messages.db. Without this, FetchAppState(fullSync=true) silently
+	// skips event dispatch and our DB never learns the correct archive status.
+	client.EmitAppStateEventsOnFullSync = true
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
