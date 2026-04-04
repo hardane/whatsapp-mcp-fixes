@@ -283,7 +283,7 @@ def get_unarchived_chats(
         sort_by=sort_by,
         include_archived=False,
     )
-    return chats
+    return [c for c in chats if c.get("jid") != "status@broadcast"]
 
 @mcp.tool()
 def archive_chat(chat_jid: str, archive: bool = True) -> Dict[str, Any]:
@@ -318,7 +318,7 @@ def get_unread_messages(
         limit: Maximum number of messages to return (default 50)
     """
     messages = whatsapp_get_unread_messages(chat_jid=chat_jid, limit=limit)
-    return messages
+    return [m for m in messages if m.get("chat_jid") != "status@broadcast"]
 
 if __name__ == "__main__":
     # Initialize and run the server

@@ -42,6 +42,11 @@ import (
 var pendingRecoveryMu sync.Mutex
 var pendingRecovery = make(map[appstate.WAPatchName]bool)
 
+// Debug counters for archive events during startup
+var archiveEventCount int32
+var archiveSetTrue int32
+var archiveSetFalse int32
+
 // recoveryDone is signaled when AppStateSyncComplete fires with Recovery=true.
 // Used by /api/test-recovery to wait for the phone's response.
 var recoveryDone = make(chan appstate.WAPatchName, 4)
@@ -58,7 +63,37 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db       *sql.DB
+	lidStore store.LIDStore
+}
+
+// SetLIDStore sets the LID↔PN mapping store so NormalizeJID can resolve JIDs.
+func (s *MessageStore) SetLIDStore(ls store.LIDStore) {
+	s.lidStore = ls
+}
+
+// NormalizeJID converts a types.JID to the canonical string used as DB key.
+// For individual chats (s.whatsapp.net / lid), it prefers the LID form.
+// Groups (@g.us) and other JID types are returned as-is.
+func (s *MessageStore) NormalizeJID(jid types.JID) string {
+	raw := jid.String()
+
+	if s.lidStore == nil {
+		return raw
+	}
+
+	switch jid.Server {
+	case "s.whatsapp.net":
+		// Phone number → try to resolve to LID
+		lidJID, err := s.lidStore.GetLIDForPN(context.Background(), jid)
+		if err == nil && !lidJID.IsEmpty() {
+			return lidJID.String()
+		}
+	case "lid":
+		// Already a LID — use as-is
+	}
+
+	return raw
 }
 
 // Initialize message store
@@ -200,6 +235,13 @@ func (store *MessageStore) StoreHistoryMessage(id, chatJID, sender, content stri
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, isRead,
 	)
 	return err
+}
+
+// ChatExists returns true if a chat with the given JID exists in the database.
+func (store *MessageStore) ChatExists(jid string) bool {
+	var count int
+	err := store.db.QueryRow(`SELECT COUNT(*) FROM chats WHERE jid = ?`, jid).Scan(&count)
+	return err == nil && count > 0
 }
 
 // SetChatArchived updates the archive status of a chat (upserts so app state events
@@ -615,8 +657,8 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
+	// Save message to database — normalize JID to LID for individual chats
+	chatJID := messageStore.NormalizeJID(msg.Info.Chat)
 	sender := msg.Info.Sender.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
@@ -1487,19 +1529,12 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// resolveJID converts a JID to the canonical form used in our database.
-	// App state events use LID JIDs for individual chats, but history sync
-	// stores chats under phone number JIDs. This function resolves LID → PN
-	// so app state updates hit the correct row.
+	// Wire up LID store so NormalizeJID can resolve PN → LID
+	messageStore.SetLIDStore(client.Store.LIDs)
+
+	// resolveJID normalizes a JID to the canonical form (LID for individuals).
 	resolveJID := func(jid types.JID) string {
-		if jid.Server == "lid" {
-			pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
-			if err == nil && !pnJID.IsEmpty() {
-				return pnJID.String()
-			}
-			// LID not mapped yet — fall back to LID string
-		}
-		return jid.String()
+		return messageStore.NormalizeJID(jid)
 	}
 
 	// attemptRecovery tries to fix a broken app state patch chain.
@@ -1543,7 +1578,14 @@ func main() {
 		case *events.Archive:
 			chatJID := resolveJID(v.JID)
 			archived := v.Action.GetArchived()
-			fmt.Printf("[APP_STATE] Archive event: %s archived=%v\n", chatJID, archived)
+			archiveEventCount++
+			if archived {
+				archiveSetTrue++
+			} else {
+				archiveSetFalse++
+			}
+			fmt.Printf("[APP_STATE] Archive event #%d: %s archived=%v (total: true=%d false=%d)\n",
+				archiveEventCount, chatJID, archived, archiveSetTrue, archiveSetFalse)
 			err := messageStore.SetChatArchived(chatJID, archived)
 			if err != nil {
 				logger.Warnf("Failed to update archive status for %s: %v", chatJID, err)
@@ -1585,7 +1627,7 @@ func main() {
 
 		case *events.Receipt:
 			if v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf {
-				chatJID := v.Chat.String()
+				chatJID := messageStore.NormalizeJID(v.Chat)
 				err := messageStore.MarkMessagesAsRead(chatJID, v.MessageIDs)
 				if err != nil {
 					logger.Warnf("Failed to mark messages as read in %s: %v", chatJID, err)
@@ -1919,14 +1961,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
+		rawJID := *conversation.ID
 
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		jid, err := types.ParseJID(rawJID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", rawJID, err)
 			continue
 		}
+
+		// Normalize to LID for individual chats
+		chatJID := messageStore.NormalizeJID(jid)
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1940,15 +1985,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		var isPinned bool
 		var muteEndTime uint64
 
+		// Always default to archived. App state Archive events are the
+		// sole authority for archive status — history sync's GetArchived()
+		// is unreliable (returns false for most archived chats in
+		// INITIAL_BOOTSTRAP). App state events with archived=false will
+		// flip the truly unarchived chats.
+		isArchived = true
+
 		if isVisibleSync {
-			isArchived = conversation.GetArchived()
 			unreadCount = conversation.GetUnreadCount()
 			markedAsUnread = conversation.GetMarkedAsUnread()
 			isPinned = conversation.GetPinned() > 0
 			muteEndTime = conversation.GetMuteEndTime()
-		} else {
-			// Old/background chat — default to archived
-			isArchived = true
 		}
 
 		// Process messages
@@ -2120,7 +2168,7 @@ func backfillContactNames(client *whatsmeow.Client, messageStore *MessageStore, 
 			continue
 		}
 
-		chatJID := jid.String()
+		chatJID := messageStore.NormalizeJID(jid)
 		err := messageStore.UpdateChatName(chatJID, name)
 		if err != nil {
 			logger.Warnf("Backfill: failed to update %s: %v", chatJID, err)
