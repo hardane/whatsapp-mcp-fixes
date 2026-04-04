@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
@@ -11,6 +12,7 @@ import audio
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 N8N_TRANSCRIPTION_URL = "https://n8n.calintent.com/webhook/koba/whatsapp/transcribe"
+N8N_BEARER_TOKEN = os.environ.get("N8N_BEARER_TOKEN", "")
 
 @dataclass
 class Message:
@@ -800,9 +802,14 @@ def _transcribe_audio(file_path: str, filename: str) -> Optional[str]:
         with open(file_path, "rb") as f:
             audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
+        headers = {"Content-Type": "application/json"}
+        if N8N_BEARER_TOKEN:
+            headers["Authorization"] = "Bearer " + N8N_BEARER_TOKEN
+
         resp = requests.post(
             N8N_TRANSCRIPTION_URL,
             json={"audio_base64": audio_b64, "filename": filename},
+            headers=headers,
             timeout=30,
         )
 
