@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -261,7 +262,7 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 @mcp.tool()
 def get_unarchived_chats(
     query: Optional[str] = None,
-    limit: int = 20,
+    limit: int = 50,
     page: int = 0,
     include_last_message: bool = True,
     sort_by: str = "last_active"
@@ -270,7 +271,7 @@ def get_unarchived_chats(
 
     Args:
         query: Optional search term to filter chats by name or JID
-        limit: Maximum number of chats to return (default 20)
+        limit: Maximum number of chats to return (default 50, increase or paginate to see older chats)
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
@@ -283,7 +284,14 @@ def get_unarchived_chats(
         sort_by=sort_by,
         include_archived=False,
     )
-    return [c for c in chats if c.jid != "status@broadcast"]
+    results = []
+    for c in chats:
+        if c.jid == "status@broadcast":
+            continue
+        d = asdict(c)
+        d["marked_as_unread"] = c.marked_as_unread
+        results.append(d)
+    return results
 
 @mcp.tool()
 def archive_chat(chat_jid: str, archive: bool = True) -> Dict[str, Any]:

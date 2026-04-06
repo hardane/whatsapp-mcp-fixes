@@ -8,10 +8,14 @@ import requests
 import json
 import base64
 import audio
+from dotenv import load_dotenv
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+_BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge')
+load_dotenv(os.path.join(_BRIDGE_DIR, '.env'))
+
+MESSAGES_DB_PATH = os.path.join(_BRIDGE_DIR, 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
-N8N_TRANSCRIPTION_URL = "https://n8n.calintent.com/webhook/koba/whatsapp/transcribe"
+N8N_TRANSCRIPTION_URL = os.environ.get("N8N_TRANSCRIPTION_URL", "")
 N8N_BEARER_TOKEN = os.environ.get("N8N_BEARER_TOKEN", "")
 
 @dataclass
@@ -38,6 +42,11 @@ class Chat:
     unread_count: Optional[int] = 0
     is_pinned: Optional[bool] = False
     mute_end_time: Optional[int] = 0
+
+    @property
+    def marked_as_unread(self) -> bool:
+        """True when the user manually marked the chat as unread (unread_count == -1)."""
+        return self.unread_count == -1
 
     @property
     def is_group(self) -> bool:

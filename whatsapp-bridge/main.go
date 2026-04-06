@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -18,7 +17,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,32 +47,6 @@ var pendingRecovery = make(map[appstate.WAPatchName]bool)
 var recoveryDone = make(chan appstate.WAPatchName, 4)
 
 
-// syncLog writes structured debug data to store/sync-debug.log so we can
-// analyze sync behavior without scrolling through noisy console output.
-var syncLog *log.Logger
-
-// Running totals for sync debug logging (atomically updated).
-var totalHSyncEvents int64
-var totalHSyncConvs int64
-var totalHSyncMsgsStored int64
-var totalHSyncMsgsSkipped int64
-var totalAppStateArchive int64
-var totalAppStateArchiveTrue int64
-var totalAppStateArchiveFalse int64
-var totalJIDResolveOK int64
-var totalJIDResolveFail int64
-
-func initSyncDebugLog() *os.File {
-	f, err := os.OpenFile("store/sync-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		fmt.Printf("WARNING: could not open sync-debug.log: %v\n", err)
-		syncLog = log.New(os.Stdout, "[SYNC] ", log.Ltime)
-		return nil
-	}
-	syncLog = log.New(f, "", log.Ltime)
-	syncLog.Println("=== Sync debug log started ===")
-	return f
-}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -104,9 +76,6 @@ func (s *MessageStore) NormalizeJID(jid types.JID) string {
 	raw := jid.String()
 
 	if s.lidStore == nil {
-		if syncLog != nil {
-			syncLog.Printf("[JID] %s → PASSTHROUGH (no LID store)", raw)
-		}
 		return raw
 	}
 
@@ -115,15 +84,7 @@ func (s *MessageStore) NormalizeJID(jid types.JID) string {
 		// Phone number → try to resolve to LID
 		lidJID, err := s.lidStore.GetLIDForPN(context.Background(), jid)
 		if err == nil && !lidJID.IsEmpty() {
-			atomic.AddInt64(&totalJIDResolveOK, 1)
-			if syncLog != nil {
-				syncLog.Printf("[JID] %s → %s (OK)", raw, lidJID.String())
-			}
 			return lidJID.String()
-		}
-		atomic.AddInt64(&totalJIDResolveFail, 1)
-		if syncLog != nil {
-			syncLog.Printf("[JID] %s → FAILED (err=%v empty=%v)", raw, err, lidJID.IsEmpty())
 		}
 	case "lid":
 		// Already a LID — use as-is
@@ -1498,7 +1459,7 @@ func main() {
 	loadEnv(".env")
 
 	logsURL := os.Getenv("LOGS_URL")
-	bearerToken := os.Getenv("LOGS_BEARER_TOKEN")
+	bearerToken := os.Getenv("N8N_BEARER_TOKEN")
 
 	// Set up logger (with optional HTTP alerting for WARN/ERROR)
 	baseLogger := waLog.Stdout("Client", "INFO", true)
@@ -1552,11 +1513,6 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Initialize sync debug log
-	syncDebugFile := initSyncDebugLog()
-	if syncDebugFile != nil {
-		defer syncDebugFile.Close()
-	}
 
 	// Wire up LID store so NormalizeJID can resolve PN → LID
 	messageStore.SetLIDStore(client.Store.LIDs)
@@ -1605,56 +1561,27 @@ func main() {
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Archive:
-			rawJID := v.JID.String()
 			chatJID := resolveJID(v.JID)
 			archived := v.Action.GetArchived()
-			actionTS := v.Timestamp
 			fmt.Printf("[APP_STATE] Archive event: %s archived=%v\n", chatJID, archived)
-			atomic.AddInt64(&totalAppStateArchive, 1)
-			if archived {
-				atomic.AddInt64(&totalAppStateArchiveTrue, 1)
-			} else {
-				atomic.AddInt64(&totalAppStateArchiveFalse, 1)
-			}
-			if syncLog != nil {
-				resolveStatus := "SAME"
-				if chatJID != rawJID {
-					resolveStatus = "RESOLVED"
-				} else if v.JID.Server == "s.whatsapp.net" {
-					resolveStatus = "LID_FAIL"
-				} else if v.JID.Server == "lid" {
-					resolveStatus = "LID_NATIVE"
-				}
-				syncLog.Printf("[APPSTATE] Archive: raw=%s resolved=%s (%s) archived=%v ts=%s (totals: true=%d false=%d)",
-					rawJID, chatJID, resolveStatus, archived, actionTS.Format(time.RFC3339),
-					atomic.LoadInt64(&totalAppStateArchiveTrue), atomic.LoadInt64(&totalAppStateArchiveFalse))
-			}
 			err := messageStore.SetChatArchived(chatJID, archived)
 			if err != nil {
 				logger.Warnf("Failed to update archive status for %s: %v", chatJID, err)
 			}
 
 		case *events.Pin:
-			rawJID := v.JID.String()
 			chatJID := resolveJID(v.JID)
 			pinned := v.Action.GetPinned()
 			fmt.Printf("[APP_STATE] Pin event: %s pinned=%v\n", chatJID, pinned)
-			if syncLog != nil {
-				syncLog.Printf("[APPSTATE] Pin: raw=%s resolved=%s pinned=%v", rawJID, chatJID, pinned)
-			}
 			err := messageStore.SetChatPinned(chatJID, pinned)
 			if err != nil {
 				logger.Warnf("Failed to update pin status for %s: %v", chatJID, err)
 			}
 
 		case *events.Mute:
-			rawJID := v.JID.String()
 			chatJID := resolveJID(v.JID)
 			muteEnd := v.Action.GetMuteEndTimestamp()
 			fmt.Printf("[APP_STATE] Mute event: %s muteEnd=%v\n", chatJID, muteEnd)
-			if syncLog != nil {
-				syncLog.Printf("[APPSTATE] Mute: raw=%s resolved=%s muteEnd=%v", rawJID, chatJID, muteEnd)
-			}
 			err := messageStore.SetChatMuted(chatJID, muteEnd)
 			if err != nil {
 				logger.Warnf("Failed to update mute status for %s: %v", chatJID, err)
@@ -1693,11 +1620,8 @@ func main() {
 			// On fresh pairings, client.Store.LIDs is nil before QR scan completes.
 			if client.Store.LIDs != nil {
 				messageStore.SetLIDStore(client.Store.LIDs)
-				if syncLog != nil {
-					syncLog.Println("[STARTUP] LID store wired after Connected event")
-				}
-			} else if syncLog != nil {
-				syncLog.Println("[STARTUP] WARNING: client.Store.LIDs still nil after Connected event")
+			} else {
+				logger.Warnf("client.Store.LIDs still nil after Connected event")
 			}
 			pendingRecoveryMu.Lock()
 			pending := make([]appstate.WAPatchName, 0, len(pendingRecovery))
@@ -1869,31 +1793,8 @@ func main() {
 
 	// Reconcile PN/LID duplicate rows once the LID store has populated.
 	go func() {
-		// --- COMMENTED OUT: forced app state resync (Experiment #3) ---
-		// Was a defensive guard against one-time LTHash corruption.
-		// Removed to simplify startup — natural app state events are sufficient.
-		//
-		// time.Sleep(10 * time.Second)
-		// if syncLog != nil {
-		// 	syncLog.Println("[STARTUP] Beginning app state resync...")
-		// }
-		// logger.Infof("Performing startup resync of regular_low app state...")
-		// if err := client.Store.AppState.DeleteAppStateVersion(context.Background(), string(appstate.WAPatchRegularLow)); err != nil {
-		// 	logger.Warnf("Failed to clear regular_low app state version on startup: %v", err)
-		// }
-		// if err := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false); err != nil {
-		// 	logger.Warnf("Startup resync of regular_low failed: %v (will recover on demand)", err)
-		// } else {
-		// 	logger.Infof("Startup resync of regular_low succeeded")
-		// }
-		// if syncLog != nil {
-		// 	syncLog.Printf("[STARTUP] App state resync done. Archive totals: true=%d false=%d",
-		// 		atomic.LoadInt64(&totalAppStateArchiveTrue), atomic.LoadInt64(&totalAppStateArchiveFalse))
-		// }
-		// --- END COMMENTED OUT ---
-
 		// Wait for events to settle, then reconcile JID rows
-		time.Sleep(15 * time.Second) // combined wait (was 10s + 5s)
+		time.Sleep(15 * time.Second)
 		reconcileJIDRows(messageStore, logger)
 	}()
 
@@ -2023,15 +1924,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	syncType := historySync.Data.GetSyncType()
 	numConvs := len(historySync.Data.Conversations)
 	fmt.Printf("Received history sync event: type=%s, conversations=%d\n", syncType, numConvs)
-	if syncLog != nil {
-		syncLog.Printf("[HSYNC] Event: type=%s conversations=%d", syncType, numConvs)
-	}
 
-	// Per-event counters
 	eventStored := 0
-	eventSkippedEmpty := 0
-	eventSkippedNil := 0
-	eventConvs := 0
 
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -2050,12 +1944,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		// Normalize to LID for individual chats
 		chatJID := messageStore.NormalizeJID(jid)
-		jidResolved := "SAME"
-		if chatJID != rawJID {
-			jidResolved = "LID_OK"
-		} else if jid.Server == "s.whatsapp.net" {
-			jidResolved = "LID_FAIL"
-		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -2071,19 +1959,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		// Process messages
 		messages := conversation.Messages
-		convMsgsRaw := len(messages)
 		convStored := 0
-		convSkippedEmpty := 0
-		convSkippedNil := 0
 
 		if len(messages) > 0 {
 			// Update chat with latest message timestamp
 			latestMsg := messages[0]
 			if latestMsg == nil || latestMsg.Message == nil {
-				convSkippedNil++
-				if syncLog != nil {
-					syncLog.Printf("[HSYNC]   Conv: %s → %s (%s) msgs_raw=%d SKIPPED (nil latestMsg)", rawJID, chatJID, jidResolved, convMsgsRaw)
-				}
 				continue
 			}
 
@@ -2092,10 +1973,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
 				timestamp = time.Unix(int64(ts), 0)
 			} else {
-				convSkippedNil++
-				if syncLog != nil {
-					syncLog.Printf("[HSYNC]   Conv: %s → %s (%s) msgs_raw=%d SKIPPED (no timestamp)", rawJID, chatJID, jidResolved, convMsgsRaw)
-				}
 				continue
 			}
 
@@ -2121,7 +1998,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			// Store messages
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
-					convSkippedNil++
 					continue
 				}
 
@@ -2146,7 +2022,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
-					convSkippedEmpty++
 					continue
 				}
 
@@ -2179,7 +2054,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
 					timestamp = time.Unix(int64(ts), 0)
 				} else {
-					convSkippedNil++
 					continue
 				}
 
@@ -2218,31 +2092,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 
 		eventStored += convStored
-		eventSkippedEmpty += convSkippedEmpty
-		eventSkippedNil += convSkippedNil
-		eventConvs++
-
-		if syncLog != nil {
-			syncLog.Printf("[HSYNC]   Conv: %s → %s (%s) archived=%v pinned=%v muteEnd=%d unread=%d markedUnread=%v msgs_raw=%d stored=%d skipped_empty=%d skipped_nil=%d",
-				rawJID, chatJID, jidResolved, conversation.GetArchived(), pinned, muteEndTime, unreadCount, conversation.GetMarkedAsUnread(), convMsgsRaw, convStored, convSkippedEmpty, convSkippedNil)
-		}
 	}
-
-	// Update running totals
-	atomic.AddInt64(&totalHSyncEvents, 1)
-	atomic.AddInt64(&totalHSyncConvs, int64(eventConvs))
-	atomic.AddInt64(&totalHSyncMsgsStored, int64(eventStored))
-	atomic.AddInt64(&totalHSyncMsgsSkipped, int64(eventSkippedEmpty+eventSkippedNil))
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", eventStored)
-	if syncLog != nil {
-		syncLog.Printf("[HSYNC] Event complete: type=%s convs=%d stored=%d skipped_empty=%d skipped_nil=%d",
-			syncType, eventConvs, eventStored, eventSkippedEmpty, eventSkippedNil)
-		syncLog.Printf("[HSYNC] Running totals: events=%d convs=%d msgs_stored=%d msgs_skipped=%d jid_ok=%d jid_fail=%d",
-			atomic.LoadInt64(&totalHSyncEvents), atomic.LoadInt64(&totalHSyncConvs),
-			atomic.LoadInt64(&totalHSyncMsgsStored), atomic.LoadInt64(&totalHSyncMsgsSkipped),
-			atomic.LoadInt64(&totalJIDResolveOK), atomic.LoadInt64(&totalJIDResolveFail))
-	}
 }
 
 // reconcileJIDRows fixes the JID format split where history sync stored chats
@@ -2250,14 +2102,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 // @lid. It merges metadata from LID rows into PN rows, migrates messages, and
 // renames to canonical LID format.
 func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
-	if syncLog != nil {
-		syncLog.Println("[RECONCILE] Starting JID reconciliation pass...")
-	}
-
 	if messageStore.lidStore == nil {
-		if syncLog != nil {
-			syncLog.Println("[RECONCILE] No LID store available, skipping")
-		}
 		return
 	}
 
@@ -2265,9 +2110,7 @@ func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
 	rows, err := messageStore.db.Query(
 		`SELECT jid, name, is_archived, is_pinned, mute_end_time FROM chats WHERE jid LIKE '%@s.whatsapp.net'`)
 	if err != nil {
-		if syncLog != nil {
-			syncLog.Printf("[RECONCILE] Query failed: %v", err)
-		}
+		logger.Warnf("[RECONCILE] Query failed: %v", err)
 		return
 	}
 
@@ -2303,9 +2146,6 @@ func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
 		lidJID, err := messageStore.lidStore.GetLIDForPN(context.Background(), pnJID)
 		if err != nil || lidJID.IsEmpty() {
 			skipped++
-			if syncLog != nil {
-				syncLog.Printf("[RECONCILE]   %s → LID lookup failed (err=%v), skipping", pn.jid, err)
-			}
 			continue
 		}
 
@@ -2351,15 +2191,8 @@ func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
 
 			if err := tx.Commit(); err != nil {
 				tx.Rollback()
-				if syncLog != nil {
-					syncLog.Printf("[RECONCILE]   %s → MERGE FAILED: %v", pn.jid, err)
-				}
 				skipped++
 				continue
-			}
-
-			if syncLog != nil {
-				syncLog.Printf("[RECONCILE]   %s → %s MERGED (archived=%v pinned=%v name=%s)", pn.jid, lidStr, lidArchived, lidPinned, pn.name)
 			}
 			merged++
 		} else {
@@ -2369,15 +2202,8 @@ func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
 
 			if err := tx.Commit(); err != nil {
 				tx.Rollback()
-				if syncLog != nil {
-					syncLog.Printf("[RECONCILE]   %s → RENAME FAILED: %v", pn.jid, err)
-				}
 				skipped++
 				continue
-			}
-
-			if syncLog != nil {
-				syncLog.Printf("[RECONCILE]   %s → %s RENAMED", pn.jid, lidStr)
 			}
 			renamed++
 		}
@@ -2386,9 +2212,6 @@ func reconcileJIDRows(messageStore *MessageStore, logger waLog.Logger) {
 	summary := fmt.Sprintf("[RECONCILE] Done: %d PN rows processed — merged=%d renamed=%d skipped=%d",
 		len(pnRows), merged, renamed, skipped)
 	fmt.Println(summary)
-	if syncLog != nil {
-		syncLog.Println(summary)
-	}
 }
 
 // backfillContactNames iterates over all chats whose name is still a phone number
