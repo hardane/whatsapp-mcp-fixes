@@ -283,7 +283,7 @@ def get_unarchived_chats(
         sort_by=sort_by,
         include_archived=False,
     )
-    return [c for c in chats if c.get("jid") != "status@broadcast"]
+    return [c for c in chats if c.jid != "status@broadcast"]
 
 @mcp.tool()
 def archive_chat(chat_jid: str, archive: bool = True) -> Dict[str, Any]:
