@@ -834,7 +834,7 @@ def _transcribe_audio(file_path: str, filename: str) -> Optional[str]:
         return None
 
 
-def download_media(message_id: str, chat_jid: str) -> Optional[dict]:
+def download_media(message_id: str, chat_jid: str) -> dict:
     """Download media from a message. Audio files are automatically transcribed.
 
     Args:
@@ -842,7 +842,8 @@ def download_media(message_id: str, chat_jid: str) -> Optional[dict]:
         chat_jid: The JID of the chat containing the message
 
     Returns:
-        A dict with path, media_type, filename, and optionally transcript. None on failure.
+        On success: dict with path, media_type, filename, and optionally transcript.
+        On failure: dict with "error" key describing what went wrong.
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/download"
@@ -868,21 +869,23 @@ def download_media(message_id: str, chat_jid: str) -> Optional[dict]:
 
                 return out
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
-                return None
+                err = result.get("message", "Unknown error")
+                print(f"Download failed: {err}")
+                return {"error": err}
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
-            return None
+            err = f"HTTP {response.status_code} - {response.text}"
+            print(f"Error: {err}")
+            return {"error": err}
 
     except requests.RequestException as e:
         print(f"Request error: {str(e)}")
-        return None
+        return {"error": f"Request error: {str(e)}"}
     except json.JSONDecodeError:
         print(f"Error parsing response: {response.text}")
-        return None
+        return {"error": f"Invalid JSON response: {response.text}"}
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
-        return None
+        return {"error": f"Unexpected error: {str(e)}"}
 
 
 def archive_chat(chat_jid: str, archive: bool = True) -> Tuple[bool, str]:

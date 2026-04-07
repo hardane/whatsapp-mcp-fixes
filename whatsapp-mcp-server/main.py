@@ -238,10 +238,20 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """
     result = whatsapp_download_media(message_id, chat_jid)
 
-    if result is None:
+    if result is None or result.get("error"):
+        err = (result or {}).get("error", "Unknown error")
+        # WhatsApp's CDN returns 403/404 once a media blob has expired or been
+        # rotated off their servers — typically for older messages that were
+        # never cached locally. Surface a human-friendly explanation.
+        if "403" in err or "404" in err:
+            return {
+                "success": False,
+                "message": "Old media no longer available on WhatsApp's servers. Check it on your phone.",
+                "error_detail": err,
+            }
         return {
             "success": False,
-            "message": "Failed to download media"
+            "message": f"Failed to download media: {err}"
         }
 
     response = {
