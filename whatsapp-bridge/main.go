@@ -699,6 +699,69 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+
+	// Fire webhook if WEBHOOK_URL is set and message matches optional TRIGGER_PREFIX
+	if content != "" {
+		go fireWebhook(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp.Unix(), msg.Info.IsFromMe, logger)
+	}
+}
+
+// WebhookPayload is the JSON body sent to WEBHOOK_URL on matching messages.
+type WebhookPayload struct {
+	MessageID     string `json:"message_id"`
+	ChatJID       string `json:"chat_jid"`
+	Sender        string `json:"sender"`
+	Text          string `json:"text"`
+	Prompt        string `json:"prompt"`
+	Timestamp     int64  `json:"timestamp"`
+	IsFromMe      bool   `json:"is_from_me"`
+	TriggerPrefix string `json:"trigger_prefix"`
+}
+
+// fireWebhook POSTs a WebhookPayload to WEBHOOK_URL when a message matches TRIGGER_PREFIX.
+// If TRIGGER_PREFIX is empty, every message is forwarded.
+// Runs in a goroutine — network errors are logged but never block message processing.
+func fireWebhook(msgID, chatJID, sender, text string, ts int64, isFromMe bool, logger waLog.Logger) {
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	if webhookURL == "" {
+		return
+	}
+
+	prefix := os.Getenv("TRIGGER_PREFIX")
+	if prefix != "" && !strings.HasPrefix(text, prefix) {
+		return
+	}
+
+	prompt := text
+	if prefix != "" {
+		prompt = strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	}
+
+	payload := WebhookPayload{
+		MessageID:     msgID,
+		ChatJID:       chatJID,
+		Sender:        sender,
+		Text:          text,
+		Prompt:        prompt,
+		Timestamp:     ts,
+		IsFromMe:      isFromMe,
+		TriggerPrefix: prefix,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf("[webhook] Failed to marshal payload: %v", err)
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		logger.Warnf("[webhook] POST to %s failed: %v", webhookURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	logger.Infof("[webhook] Triggered %s → %d (msg %s)", webhookURL, resp.StatusCode, msgID)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -929,8 +992,15 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Optional path prefix for lightweight security-through-obscurity.
+	// Set API_SECRET env var to require e.g. /mysecret/api/send instead of /api/send.
+	prefix := ""
+	if secret := os.Getenv("API_SECRET"); secret != "" {
+		prefix = "/" + secret
+	}
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(prefix+"/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -976,7 +1046,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(prefix+"/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1028,7 +1098,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for archiving/unarchiving chats
-	http.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(prefix+"/api/archive", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1105,7 +1175,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for marking chats as read
-	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(prefix+"/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
